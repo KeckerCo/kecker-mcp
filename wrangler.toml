@@ -1,0 +1,15 @@
+name = "kecker-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "VAULT"
+id = "6e64355cfffd4082adbca1c1d0d17bed"
+
+[vars]
+GITHUB_ORG = "KeckerCo"
+VAULT_REPO = "kecker-vault"
+
+[ai]
+binding = "AI"
