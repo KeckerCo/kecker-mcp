@@ -41,13 +41,29 @@ function randomToken(bytes = 32): string {
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function resolveClient(
+  clientId: string,
+  clientSecret: string | undefined,
+  env: Env
+): Promise<boolean> {
+  // Static pre-configured client
+  if (clientId === env.OAUTH_CLIENT_ID) {
+    if (clientSecret === undefined) return true; // authorize step (no secret needed)
+    return clientSecret === env.OAUTH_CLIENT_SECRET;
+  }
+  // Dynamically registered client stored in KV
+  const stored = await env.VAULT.get(`oauth:client:${clientId}`);
+  if (!stored) return false;
+  const reg = JSON.parse(stored) as { client_secret: string };
+  if (clientSecret === undefined) return true;
+  return clientSecret === reg.client_secret;
+}
+
 async function validateBearer(req: Request, env: Env): Promise<boolean> {
   const auth = req.headers.get("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) return false;
   const token = auth.slice(7);
-  // static token
   if (env.KECKER_MCP_TOKEN && token === env.KECKER_MCP_TOKEN) return true;
-  // oauth-issued access token stored in KV
   const stored = await env.VAULT.get(`oauth:access:${token}`);
   return stored !== null;
 }
@@ -195,117 +211,135 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ── OAuth 2.0 protected resource metadata (RFC 9728) ──────────────────
+    // ── RFC 9728: protected resource metadata ─────────────────────────────
     if (url.pathname === "/.well-known/oauth-protected-resource") {
       return json({
         resource: origin,
-        authorization_servers: [`${origin}`],
+        authorization_servers: [origin],
         bearer_methods_supported: ["header"],
         scopes_supported: ["mcp"],
       });
     }
 
-    // ── OAuth 2.0 authorization server metadata (RFC 8414) ────────────────
+    // ── RFC 8414: authorization server metadata ───────────────────────────
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       return json({
         issuer: origin,
         authorization_endpoint: `${origin}/authorize`,
         token_endpoint: `${origin}/token`,
+        registration_endpoint: `${origin}/register`,
         token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
         grant_types_supported: ["authorization_code", "client_credentials"],
         response_types_supported: ["code"],
-        code_challenge_methods_supported: ["S256"],
+        code_challenge_methods_supported: ["S256", "plain"],
         scopes_supported: ["mcp"],
       });
     }
 
-    // ── Authorization endpoint (authorization code flow) ──────────────────
+    // ── RFC 7591: dynamic client registration ─────────────────────────────
+    if (url.pathname === "/register" && req.method === "POST") {
+      const body = await req.json() as Record<string, unknown>;
+      const clientId = randomToken(16);
+      const clientSecret = randomToken(32);
+      const reg = {
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uris: body.redirect_uris ?? [],
+        grant_types: body.grant_types ?? ["authorization_code"],
+        token_endpoint_auth_method: body.token_endpoint_auth_method ?? "client_secret_post",
+        client_name: body.client_name ?? "MCP Client",
+      };
+      await env.VAULT.put(`oauth:client:${clientId}`, JSON.stringify(reg), {
+        expirationTtl: 3600 * 24 * 90,
+      });
+      return json({ ...reg, client_id_issued_at: Math.floor(Date.now() / 1000) }, 201);
+    }
+
+    // ── Authorization endpoint ─────────────────────────────────────────────
     if (url.pathname === "/authorize") {
-      const clientId = url.searchParams.get("client_id");
-      const redirectUri = url.searchParams.get("redirect_uri");
+      const clientId = url.searchParams.get("client_id") ?? "";
+      const redirectUri = url.searchParams.get("redirect_uri") ?? "";
       const state = url.searchParams.get("state") ?? "";
       const codeChallenge = url.searchParams.get("code_challenge");
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "S256";
 
-      if (!clientId || clientId !== env.OAUTH_CLIENT_ID) {
-        return json({ error: "invalid_client" }, 400);
-      }
-      if (!redirectUri) {
-        return json({ error: "invalid_request", error_description: "redirect_uri required" }, 400);
-      }
+      if (!clientId) return json({ error: "invalid_request", error_description: "client_id required" }, 400);
+      if (!redirectUri) return json({ error: "invalid_request", error_description: "redirect_uri required" }, 400);
 
-      // Auto-approve: generate authorization code
+      // Validate client (no secret check here — just that it exists)
+      const valid = await resolveClient(clientId, undefined, env);
+      if (!valid) return json({ error: "invalid_client" }, 400);
+
       const code = randomToken(24);
       await env.VAULT.put(
         `oauth:code:${code}`,
-        JSON.stringify({ clientId, redirectUri, codeChallenge }),
-        { expirationTtl: 300 } // 5 minutes
+        JSON.stringify({ clientId, redirectUri, codeChallenge, codeChallengeMethod }),
+        { expirationTtl: 300 }
       );
 
-      const redirect = new URL(redirectUri);
-      redirect.searchParams.set("code", code);
-      if (state) redirect.searchParams.set("state", state);
-      return Response.redirect(redirect.toString(), 302);
+      const dest = new URL(redirectUri);
+      dest.searchParams.set("code", code);
+      if (state) dest.searchParams.set("state", state);
+      return Response.redirect(dest.toString(), 302);
     }
 
     // ── Token endpoint ─────────────────────────────────────────────────────
     if (url.pathname === "/token" && req.method === "POST") {
-      let params: Record<string, string> = {};
-
+      let p: Record<string, string> = {};
       const ct = req.headers.get("Content-Type") ?? "";
       if (ct.includes("application/x-www-form-urlencoded")) {
-        const text = await req.text();
-        for (const [k, v] of new URLSearchParams(text)) params[k] = v;
+        for (const [k, v] of new URLSearchParams(await req.text())) p[k] = v;
       } else {
-        params = (await req.json()) as Record<string, string>;
+        p = (await req.json()) as Record<string, string>;
       }
 
-      // Support HTTP Basic auth for client credentials
+      // HTTP Basic auth support
       const basic = req.headers.get("Authorization");
       if (basic?.startsWith("Basic ")) {
         const [id, secret] = atob(basic.slice(6)).split(":", 2);
-        params.client_id ??= id;
-        params.client_secret ??= secret;
+        p.client_id ??= id;
+        p.client_secret ??= secret;
       }
 
-      const { grant_type, client_id, client_secret, code, code_verifier, redirect_uri } = params;
+      const { grant_type, client_id, client_secret, code, code_verifier, redirect_uri } = p;
 
-      // Validate client identity for all flows
-      if (client_id !== env.OAUTH_CLIENT_ID || client_secret !== env.OAUTH_CLIENT_SECRET) {
-        return json({ error: "invalid_client" }, 401);
-      }
+      const clientOk = await resolveClient(client_id, client_secret, env);
+      if (!clientOk) return json({ error: "invalid_client" }, 401);
 
       if (grant_type === "authorization_code") {
         if (!code) return json({ error: "invalid_request", error_description: "code required" }, 400);
+        const raw = await env.VAULT.get(`oauth:code:${code}`);
+        if (!raw) return json({ error: "invalid_grant" }, 400);
 
-        const stored = await env.VAULT.get(`oauth:code:${code}`);
-        if (!stored) return json({ error: "invalid_grant" }, 400);
-
-        const { redirectUri, codeChallenge } = JSON.parse(stored) as {
+        const stored = JSON.parse(raw) as {
           clientId: string;
           redirectUri: string;
           codeChallenge?: string;
+          codeChallengeMethod?: string;
         };
 
-        if (redirect_uri && redirect_uri !== redirectUri) {
+        if (stored.clientId !== client_id)
+          return json({ error: "invalid_grant", error_description: "client_id mismatch" }, 400);
+        if (redirect_uri && redirect_uri !== stored.redirectUri)
           return json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
-        }
 
-        // Verify PKCE if used
-        if (codeChallenge && code_verifier) {
-          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(code_verifier));
-          const b64 = btoa(String.fromCharCode(...new Uint8Array(digest)))
-            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-          if (b64 !== codeChallenge) {
-            return json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
+        if (stored.codeChallenge) {
+          if (!code_verifier) return json({ error: "invalid_grant", error_description: "code_verifier required" }, 400);
+          let challenge: string;
+          if (stored.codeChallengeMethod === "plain") {
+            challenge = code_verifier;
+          } else {
+            const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(code_verifier));
+            challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+              .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
           }
+          if (challenge !== stored.codeChallenge)
+            return json({ error: "invalid_grant", error_description: "PKCE mismatch" }, 400);
         }
 
-        // Consume the code
         await env.VAULT.delete(`oauth:code:${code}`);
-
         const accessToken = randomToken(32);
         await env.VAULT.put(`oauth:access:${accessToken}`, "1", { expirationTtl: 3600 * 24 * 30 });
-
         return json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600 * 24 * 30, scope: "mcp" });
 
       } else if (grant_type === "client_credentials") {
@@ -318,7 +352,7 @@ export default {
       }
     }
 
-    // ── All other routes require auth ──────────────────────────────────────
+    // ── MCP endpoint — requires auth ───────────────────────────────────────
     const authed = await validateBearer(req, env);
     if (!authed) {
       return new Response(JSON.stringify({ error: "unauthorized" }), {
@@ -331,7 +365,6 @@ export default {
       });
     }
 
-    const handler = createMcpHandler(buildMcpServer(env));
-    return handler(req, env, ctx);
+    return createMcpHandler(buildMcpServer(env))(req, env, ctx);
   },
 };
