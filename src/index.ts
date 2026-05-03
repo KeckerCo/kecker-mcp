@@ -22,7 +22,7 @@ const PROJECTS = [
   { id: "true-confessions-compose-multiplatform", repo: "true-confessions-compose-multiplatform", description: "True Confessions Compose Multiplatform app" },
 ];
 
-const CORS_HEADERS = {
+const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
@@ -31,21 +31,24 @@ const CORS_HEADERS = {
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: { "Content-Type": "application/json", ...CORS },
   });
 }
 
-function isAuthorized(req: Request, env: Env): boolean {
-  const auth = req.headers.get("Authorization") ?? "";
-  const token = env.KECKER_MCP_TOKEN;
-  // accept both the static bearer token and any OAuth-issued access token stored in KV
-  // (KV token lookup happens async — we handle that separately)
-  if (token && auth === `Bearer ${token}`) return true;
-  return false;
+function randomToken(bytes = 32): string {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function isOAuthTokenValid(token: string, env: Env): Promise<boolean> {
-  const stored = await env.VAULT.get(`oauth:token:${token}`);
+async function validateBearer(req: Request, env: Env): Promise<boolean> {
+  const auth = req.headers.get("Authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return false;
+  const token = auth.slice(7);
+  // static token
+  if (env.KECKER_MCP_TOKEN && token === env.KECKER_MCP_TOKEN) return true;
+  // oauth-issued access token stored in KV
+  const stored = await env.VAULT.get(`oauth:access:${token}`);
   return stored !== null;
 }
 
@@ -88,7 +91,7 @@ function buildMcpServer(env: Env): McpServer {
   server.tool(
     "update_notes",
     "Save markdown notes for a KeckerCo project",
-    { project: z.string().describe("Project ID"), notes: z.string().describe("Markdown notes content to save") },
+    { project: z.string().describe("Project ID"), notes: z.string().describe("Markdown notes content") },
     async ({ project, notes }) => {
       if (!PROJECTS.find((x) => x.id === project))
         return { content: [{ type: "text", text: `Unknown project: ${project}` }] };
@@ -119,7 +122,7 @@ function buildMcpServer(env: Env): McpServer {
   server.tool(
     "list_tasks",
     "List open tasks for a project, or all projects",
-    { project: z.string().optional().describe("Project ID; omit for all projects") },
+    { project: z.string().optional().describe("Project ID; omit for all") },
     async ({ project }) => {
       const targets = project ? PROJECTS.filter((x) => x.id === project) : PROJECTS;
       const parts: string[] = [];
@@ -155,7 +158,7 @@ function buildMcpServer(env: Env): McpServer {
     "Fetch open GitHub issues for a KeckerCo project",
     {
       project: z.string().describe("Project ID"),
-      limit: z.number().int().min(1).max(50).optional().describe("Max issues to return (default 10)"),
+      limit: z.number().int().min(1).max(50).optional().describe("Max issues (default 10)"),
     },
     async ({ project, limit = 10 }) => {
       const p = PROJECTS.find((x) => x.id === project);
@@ -173,8 +176,7 @@ function buildMcpServer(env: Env): McpServer {
         if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
         const issues = (await res.json()) as Array<{ number: number; title: string; html_url: string }>;
         if (!issues.length) return { content: [{ type: "text", text: `No open issues in ${project}.` }] };
-        const text = issues.map((i) => `#${i.number} ${i.title}\n  ${i.html_url}`).join("\n\n");
-        return { content: [{ type: "text", text }] };
+        return { content: [{ type: "text", text: issues.map((i) => `#${i.number} ${i.title}\n  ${i.html_url}`).join("\n\n") }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }] };
       }
@@ -187,97 +189,146 @@ function buildMcpServer(env: Env): McpServer {
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
+    const origin = url.origin;
 
-    // CORS preflight
     if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: CORS });
     }
 
-    // OAuth 2.0 server metadata discovery
-    if (url.pathname === "/.well-known/oauth-authorization-server") {
+    // ── OAuth 2.0 protected resource metadata (RFC 9728) ──────────────────
+    if (url.pathname === "/.well-known/oauth-protected-resource") {
       return json({
-        issuer: url.origin,
-        token_endpoint: `${url.origin}/token`,
-        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
-        grant_types_supported: ["client_credentials"],
-        response_types_supported: ["token"],
+        resource: origin,
+        authorization_servers: [`${origin}`],
+        bearer_methods_supported: ["header"],
         scopes_supported: ["mcp"],
       });
     }
 
-    // OAuth 2.0 token endpoint — client_credentials grant
-    if (url.pathname === "/token" && req.method === "POST") {
-      let clientId: string | null = null;
-      let clientSecret: string | null = null;
-      let grantType: string | null = null;
-
-      const contentType = req.headers.get("Content-Type") ?? "";
-
-      if (contentType.includes("application/x-www-form-urlencoded")) {
-        const body = await req.text();
-        const params = new URLSearchParams(body);
-        clientId = params.get("client_id");
-        clientSecret = params.get("client_secret");
-        grantType = params.get("grant_type");
-      } else if (contentType.includes("application/json")) {
-        const body = await req.json() as Record<string, string>;
-        clientId = body.client_id ?? null;
-        clientSecret = body.client_secret ?? null;
-        grantType = body.grant_type ?? null;
-      }
-
-      // Also support HTTP Basic auth for client credentials
-      const basicAuth = req.headers.get("Authorization");
-      if (basicAuth?.startsWith("Basic ")) {
-        const decoded = atob(basicAuth.slice(6));
-        const [id, secret] = decoded.split(":", 2);
-        clientId = clientId ?? id;
-        clientSecret = clientSecret ?? secret;
-      }
-
-      if (grantType !== "client_credentials") {
-        return json({ error: "unsupported_grant_type" }, 400);
-      }
-
-      if (!clientId || !clientSecret ||
-          clientId !== env.OAUTH_CLIENT_ID ||
-          clientSecret !== env.OAUTH_CLIENT_SECRET) {
-        return json({ error: "invalid_client" }, 401);
-      }
-
-      // Issue an access token (use the static bearer token as the access token)
-      const accessToken = env.KECKER_MCP_TOKEN ?? "no-token-configured";
-      // Store it in KV so the /mcp auth check can validate OAuth-issued tokens
-      await env.VAULT.put(`oauth:token:${accessToken}`, "1", { expirationTtl: 3600 * 24 * 30 });
-
+    // ── OAuth 2.0 authorization server metadata (RFC 8414) ────────────────
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
       return json({
-        access_token: accessToken,
-        token_type: "Bearer",
-        expires_in: 3600 * 24 * 30,
-        scope: "mcp",
+        issuer: origin,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+        grant_types_supported: ["authorization_code", "client_credentials"],
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+        scopes_supported: ["mcp"],
       });
     }
 
-    // All other routes require auth
-    const authHeader = req.headers.get("Authorization") ?? "";
-    const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    // ── Authorization endpoint (authorization code flow) ──────────────────
+    if (url.pathname === "/authorize") {
+      const clientId = url.searchParams.get("client_id");
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state") ?? "";
+      const codeChallenge = url.searchParams.get("code_challenge");
 
-    const staticToken = env.KECKER_MCP_TOKEN;
-    const validStatic = staticToken && bearerToken === staticToken;
-    const validOAuth = bearerToken ? await isOAuthTokenValid(bearerToken, env) : false;
+      if (!clientId || clientId !== env.OAUTH_CLIENT_ID) {
+        return json({ error: "invalid_client" }, 400);
+      }
+      if (!redirectUri) {
+        return json({ error: "invalid_request", error_description: "redirect_uri required" }, 400);
+      }
 
-    if (!validStatic && !validOAuth) {
-      return new Response(
-        JSON.stringify({ error: "unauthorized" }),
-        {
-          status: 401,
-          headers: {
-            "Content-Type": "application/json",
-            "WWW-Authenticate": `Bearer realm="${url.origin}"`,
-            ...CORS_HEADERS,
-          },
-        }
+      // Auto-approve: generate authorization code
+      const code = randomToken(24);
+      await env.VAULT.put(
+        `oauth:code:${code}`,
+        JSON.stringify({ clientId, redirectUri, codeChallenge }),
+        { expirationTtl: 300 } // 5 minutes
       );
+
+      const redirect = new URL(redirectUri);
+      redirect.searchParams.set("code", code);
+      if (state) redirect.searchParams.set("state", state);
+      return Response.redirect(redirect.toString(), 302);
+    }
+
+    // ── Token endpoint ─────────────────────────────────────────────────────
+    if (url.pathname === "/token" && req.method === "POST") {
+      let params: Record<string, string> = {};
+
+      const ct = req.headers.get("Content-Type") ?? "";
+      if (ct.includes("application/x-www-form-urlencoded")) {
+        const text = await req.text();
+        for (const [k, v] of new URLSearchParams(text)) params[k] = v;
+      } else {
+        params = (await req.json()) as Record<string, string>;
+      }
+
+      // Support HTTP Basic auth for client credentials
+      const basic = req.headers.get("Authorization");
+      if (basic?.startsWith("Basic ")) {
+        const [id, secret] = atob(basic.slice(6)).split(":", 2);
+        params.client_id ??= id;
+        params.client_secret ??= secret;
+      }
+
+      const { grant_type, client_id, client_secret, code, code_verifier, redirect_uri } = params;
+
+      // Validate client identity for all flows
+      if (client_id !== env.OAUTH_CLIENT_ID || client_secret !== env.OAUTH_CLIENT_SECRET) {
+        return json({ error: "invalid_client" }, 401);
+      }
+
+      if (grant_type === "authorization_code") {
+        if (!code) return json({ error: "invalid_request", error_description: "code required" }, 400);
+
+        const stored = await env.VAULT.get(`oauth:code:${code}`);
+        if (!stored) return json({ error: "invalid_grant" }, 400);
+
+        const { redirectUri, codeChallenge } = JSON.parse(stored) as {
+          clientId: string;
+          redirectUri: string;
+          codeChallenge?: string;
+        };
+
+        if (redirect_uri && redirect_uri !== redirectUri) {
+          return json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
+        }
+
+        // Verify PKCE if used
+        if (codeChallenge && code_verifier) {
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(code_verifier));
+          const b64 = btoa(String.fromCharCode(...new Uint8Array(digest)))
+            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+          if (b64 !== codeChallenge) {
+            return json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
+          }
+        }
+
+        // Consume the code
+        await env.VAULT.delete(`oauth:code:${code}`);
+
+        const accessToken = randomToken(32);
+        await env.VAULT.put(`oauth:access:${accessToken}`, "1", { expirationTtl: 3600 * 24 * 30 });
+
+        return json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600 * 24 * 30, scope: "mcp" });
+
+      } else if (grant_type === "client_credentials") {
+        const accessToken = randomToken(32);
+        await env.VAULT.put(`oauth:access:${accessToken}`, "1", { expirationTtl: 3600 * 24 * 30 });
+        return json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600 * 24 * 30, scope: "mcp" });
+
+      } else {
+        return json({ error: "unsupported_grant_type" }, 400);
+      }
+    }
+
+    // ── All other routes require auth ──────────────────────────────────────
+    const authed = await validateBearer(req, env);
+    if (!authed) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": `Bearer realm="${origin}", resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+          ...CORS,
+        },
+      });
     }
 
     const handler = createMcpHandler(buildMcpServer(env));
