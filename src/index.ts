@@ -8,6 +8,8 @@ export interface Env {
   VAULT_REPO: string;
   GITHUB_TOKEN?: string;
   KECKER_MCP_TOKEN?: string;
+  OAUTH_CLIENT_ID?: string;
+  OAUTH_CLIENT_SECRET?: string;
 }
 
 const PROJECTS = [
@@ -19,6 +21,33 @@ const PROJECTS = [
   { id: "shrink", repo: "shrink", description: "" },
   { id: "true-confessions-compose-multiplatform", repo: "true-confessions-compose-multiplatform", description: "True Confessions Compose Multiplatform app" },
 ];
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+};
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+function isAuthorized(req: Request, env: Env): boolean {
+  const auth = req.headers.get("Authorization") ?? "";
+  const token = env.KECKER_MCP_TOKEN;
+  // accept both the static bearer token and any OAuth-issued access token stored in KV
+  // (KV token lookup happens async — we handle that separately)
+  if (token && auth === `Bearer ${token}`) return true;
+  return false;
+}
+
+async function isOAuthTokenValid(token: string, env: Env): Promise<boolean> {
+  const stored = await env.VAULT.get(`oauth:token:${token}`);
+  return stored !== null;
+}
 
 function buildMcpServer(env: Env): McpServer {
   const server = new McpServer({ name: "kecker-mcp", version: "1.0.0" });
@@ -59,10 +88,7 @@ function buildMcpServer(env: Env): McpServer {
   server.tool(
     "update_notes",
     "Save markdown notes for a KeckerCo project",
-    {
-      project: z.string().describe("Project ID"),
-      notes: z.string().describe("Markdown notes content to save"),
-    },
+    { project: z.string().describe("Project ID"), notes: z.string().describe("Markdown notes content to save") },
     async ({ project, notes }) => {
       if (!PROJECTS.find((x) => x.id === project))
         return { content: [{ type: "text", text: `Unknown project: ${project}` }] };
@@ -95,9 +121,7 @@ function buildMcpServer(env: Env): McpServer {
     "List open tasks for a project, or all projects",
     { project: z.string().optional().describe("Project ID; omit for all projects") },
     async ({ project }) => {
-      const targets = project
-        ? PROJECTS.filter((x) => x.id === project)
-        : PROJECTS;
+      const targets = project ? PROJECTS.filter((x) => x.id === project) : PROJECTS;
       const parts: string[] = [];
       for (const p of targets) {
         const tasks = await env.VAULT.get(`tasks:${p.id}`);
@@ -162,13 +186,100 @@ function buildMcpServer(env: Env): McpServer {
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const token = env.KECKER_MCP_TOKEN;
-    if (token) {
-      const auth = req.headers.get("Authorization") ?? "";
-      if (auth !== `Bearer ${token}`) {
-        return new Response("Unauthorized", { status: 401 });
-      }
+    const url = new URL(req.url);
+
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
+
+    // OAuth 2.0 server metadata discovery
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      return json({
+        issuer: url.origin,
+        token_endpoint: `${url.origin}/token`,
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+        grant_types_supported: ["client_credentials"],
+        response_types_supported: ["token"],
+        scopes_supported: ["mcp"],
+      });
+    }
+
+    // OAuth 2.0 token endpoint — client_credentials grant
+    if (url.pathname === "/token" && req.method === "POST") {
+      let clientId: string | null = null;
+      let clientSecret: string | null = null;
+      let grantType: string | null = null;
+
+      const contentType = req.headers.get("Content-Type") ?? "";
+
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        const body = await req.text();
+        const params = new URLSearchParams(body);
+        clientId = params.get("client_id");
+        clientSecret = params.get("client_secret");
+        grantType = params.get("grant_type");
+      } else if (contentType.includes("application/json")) {
+        const body = await req.json() as Record<string, string>;
+        clientId = body.client_id ?? null;
+        clientSecret = body.client_secret ?? null;
+        grantType = body.grant_type ?? null;
+      }
+
+      // Also support HTTP Basic auth for client credentials
+      const basicAuth = req.headers.get("Authorization");
+      if (basicAuth?.startsWith("Basic ")) {
+        const decoded = atob(basicAuth.slice(6));
+        const [id, secret] = decoded.split(":", 2);
+        clientId = clientId ?? id;
+        clientSecret = clientSecret ?? secret;
+      }
+
+      if (grantType !== "client_credentials") {
+        return json({ error: "unsupported_grant_type" }, 400);
+      }
+
+      if (!clientId || !clientSecret ||
+          clientId !== env.OAUTH_CLIENT_ID ||
+          clientSecret !== env.OAUTH_CLIENT_SECRET) {
+        return json({ error: "invalid_client" }, 401);
+      }
+
+      // Issue an access token (use the static bearer token as the access token)
+      const accessToken = env.KECKER_MCP_TOKEN ?? "no-token-configured";
+      // Store it in KV so the /mcp auth check can validate OAuth-issued tokens
+      await env.VAULT.put(`oauth:token:${accessToken}`, "1", { expirationTtl: 3600 * 24 * 30 });
+
+      return json({
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: 3600 * 24 * 30,
+        scope: "mcp",
+      });
+    }
+
+    // All other routes require auth
+    const authHeader = req.headers.get("Authorization") ?? "";
+    const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+    const staticToken = env.KECKER_MCP_TOKEN;
+    const validStatic = staticToken && bearerToken === staticToken;
+    const validOAuth = bearerToken ? await isOAuthTokenValid(bearerToken, env) : false;
+
+    if (!validStatic && !validOAuth) {
+      return new Response(
+        JSON.stringify({ error: "unauthorized" }),
+        {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json",
+            "WWW-Authenticate": `Bearer realm="${url.origin}"`,
+            ...CORS_HEADERS,
+          },
+        }
+      );
+    }
+
     const handler = createMcpHandler(buildMcpServer(env));
     return handler(req, env, ctx);
   },
